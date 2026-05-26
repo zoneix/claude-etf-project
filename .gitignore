@@ -21,8 +21,9 @@ ENV/
 htmlcov/
 .tox/
 
-# Streamlit cache
-.streamlit/
+# Streamlit runtime cache and local secrets (config.toml IS tracked)
+.streamlit/cache/
+.streamlit/secrets.toml
 
 # IDE / OS
 .idea/
