@@ -16,6 +16,7 @@ from simulation import (
     get_ticker_info,
     portfolio_div_yield,
     portfolio_expense_ratio,
+    run_backtest,
     run_simulation,
 )
 
@@ -488,6 +489,190 @@ with st.expander("Historical Return Statistics", expanded=False):
             corr.style.background_gradient(cmap="RdYlGn", vmin=-1, vmax=1).format("{:.2f}"),
             use_container_width=True,
         )
+
+# ── Historical Backtest ───────────────────────────────────────────────────────
+st.divider()
+st.subheader("📊 Historical Backtest")
+st.caption(
+    f"Replay of your weighted portfolio over the selected **{hist_period}** window "
+    "using actual market data with your contribution and DRIP settings applied — "
+    "not a simulation."
+)
+
+try:
+    _bt_holding_vals = holdings_df[holdings_df["ticker"].isin(available_tickers)]["value"].values
+    _w_bt = _bt_holding_vals / _bt_holding_vals.sum()
+    _prices_bt = prices_avail[available_tickers].dropna()
+    _contrib_bt = contrib_amt if contrib_enabled else 0.0
+    _yield_bt = portfolio_div_yield(st.session_state.holdings)
+
+    bt = run_backtest(
+        weights=_w_bt,
+        prices=_prices_bt,
+        initial=total_portfolio,
+        contribution=_contrib_bt,
+        freq=contrib_freq,
+        drip=drip_enabled,
+        annual_div_yield=_yield_bt,
+    )
+
+    # ── Portfolio value chart + metrics ───────────────────────────────────────
+    bt_top_l, bt_top_r = st.columns([3, 2])
+
+    with bt_top_l:
+        st.markdown("**Portfolio Value (Historical)**")
+        fig_bt = go.Figure()
+
+        _wealth_lbl = "Total Wealth" if not drip_enabled else "Portfolio Value"
+
+        # Total wealth (or portfolio) line
+        fig_bt.add_trace(
+            go.Scatter(
+                x=bt["total_wealth"].index,
+                y=bt["total_wealth"].values,
+                name=_wealth_lbl,
+                line=dict(color="#4ade80", width=2.5),
+                hovertemplate=(
+                    f"<b>{_wealth_lbl}</b>  ·  %{{x|%b %d, %Y}}  ·  $%{{y:,.0f}}<extra></extra>"
+                ),
+            )
+        )
+
+        # DRIP OFF: also show portfolio ex-div
+        if not drip_enabled and _yield_bt > 0:
+            fig_bt.add_trace(
+                go.Scatter(
+                    x=bt["portfolio_values"].index,
+                    y=bt["portfolio_values"].values,
+                    name="Portfolio (ex-div)",
+                    line=dict(color="#a78bfa", width=1.5, dash="dash"),
+                    hovertemplate=(
+                        "<b>Portfolio (ex-div)</b>  ·  %{x|%b %d, %Y}  ·  $%{y:,.0f}<extra></extra>"
+                    ),
+                )
+            )
+
+        # Total invested line
+        fig_bt.add_trace(
+            go.Scatter(
+                x=bt["total_invested"].index,
+                y=bt["total_invested"].values,
+                name="Total Invested",
+                line=dict(color="rgba(255,255,255,0.45)", width=1.5, dash="dot"),
+                hovertemplate="<b>Total Invested</b>  ·  $%{y:,.0f}<extra></extra>",
+            )
+        )
+
+        # Real-value overlay (inflation-adjusted)
+        if show_real and inflation_rate > 0:
+            _t_yr_bt = np.array(
+                [(d - bt["total_wealth"].index[0]).days / 365.25
+                 for d in bt["total_wealth"].index]
+            )
+            _disc_bt = (1 + inflation_rate) ** _t_yr_bt
+            fig_bt.add_trace(
+                go.Scatter(
+                    x=bt["total_wealth"].index,
+                    y=bt["total_wealth"].values / _disc_bt,
+                    name=f"Real Value (@{inflation_rate:.1%})",
+                    line=dict(color="#e879f9", width=1.5, dash="longdash"),
+                    hovertemplate=(
+                        f"<b>Real Value</b>  ·  %{{x|%b %d, %Y}}  ·  $%{{y:,.0f}}<extra></extra>"
+                    ),
+                )
+            )
+
+        fig_bt.update_layout(
+            template="plotly_dark",
+            height=380,
+            xaxis_title=None,
+            yaxis=dict(title="Portfolio Value ($)", tickformat="$,.0f"),
+            legend=dict(orientation="h", y=1.05, x=0),
+            margin=dict(l=0, r=0, t=5, b=0),
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_bt, use_container_width=True)
+
+    with bt_top_r:
+        st.markdown("**Performance Summary**")
+        _yr_lbl = f"{bt['n_years']:.1f} yr"
+        _bt_metrics = [
+            ("CAGR",                    f"{bt['cagr']:+.2%}",           f"over {_yr_lbl}"),
+            ("Total Return vs Invested", f"{bt['total_return_pct']:+.2%}", None),
+            ("Max Drawdown",             f"{bt['max_drawdown']:.2%}",    None),
+            ("Sharpe Ratio (rf=0)",      f"{bt['sharpe']:.2f}",          None),
+            ("Ann. Volatility",          f"{bt['ann_vol']:.2%}",         None),
+        ]
+        if not np.isnan(bt["best_yr"]):
+            _bt_metrics.append(("Best Calendar Year",  f"{bt['best_yr']:+.2%}",  None))
+        if not np.isnan(bt["worst_yr"]):
+            _bt_metrics.append(("Worst Calendar Year", f"{bt['worst_yr']:+.2%}", None))
+        for _lbl, _val, _delta in _bt_metrics:
+            st.metric(_lbl, _val, _delta)
+
+    # ── Annual returns bar chart + historical drawdown ─────────────────────────
+    if len(bt["annual_rets"]) >= 2:
+        bt_bot_l, bt_bot_r = st.columns(2)
+
+        with bt_bot_l:
+            st.markdown("**Calendar-Year Returns**")
+            _bar_colors = [
+                "#4ade80" if r >= 0 else "#f87171" for r in bt["annual_rets"]
+            ]
+            fig_ann = go.Figure(
+                go.Bar(
+                    x=bt["annual_years"],
+                    y=bt["annual_rets"] * 100,
+                    marker_color=_bar_colors,
+                    hovertemplate="<b>%{x}</b>  ·  %{y:.2f}%<extra></extra>",
+                )
+            )
+            fig_ann.add_hline(
+                y=0,
+                line=dict(color="rgba(255,255,255,0.3)", width=1),
+            )
+            fig_ann.update_layout(
+                template="plotly_dark",
+                height=290,
+                xaxis_title=None,
+                yaxis=dict(title="Return (%)", ticksuffix="%"),
+                margin=dict(l=0, r=0, t=5, b=0),
+            )
+            st.plotly_chart(fig_ann, use_container_width=True)
+
+        with bt_bot_r:
+            st.markdown("**Historical Drawdown**")
+            _dd_max_pct = float(bt["drawdowns"].max() * 100)
+            fig_bt_dd = go.Figure(
+                go.Scatter(
+                    x=bt["drawdowns"].index,
+                    y=bt["drawdowns"].values * 100,
+                    fill="tozeroy",
+                    fillcolor="rgba(248,113,113,0.25)",
+                    line=dict(color="#f87171", width=1.5),
+                    name="Drawdown",
+                    hovertemplate="%{x|%b %d, %Y}  ·  Drawdown: %{y:.1f}%<extra></extra>",
+                )
+            )
+            fig_bt_dd.update_layout(
+                template="plotly_dark",
+                height=290,
+                xaxis_title=None,
+                yaxis=dict(
+                    title="Drawdown (%)",
+                    tickformat=".0f",
+                    ticksuffix="%",
+                    range=[max(_dd_max_pct * 1.15, 1.0), 0],  # 0 at top
+                ),
+                margin=dict(l=0, r=0, t=5, b=0),
+                showlegend=False,
+            )
+            st.plotly_chart(fig_bt_dd, use_container_width=True)
+
+except ValueError as e:
+    st.info(f"ℹ️ {e}")
+except Exception as e:
+    st.warning(f"Backtest could not be computed: {e}")
 
 # ── Run simulation ────────────────────────────────────────────────────────────
 if run_btn:

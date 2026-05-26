@@ -17,6 +17,7 @@ from simulation import (
     get_ticker_info,
     portfolio_div_yield,
     portfolio_expense_ratio,
+    run_backtest,
     run_simulation,
 )
 
@@ -42,6 +43,21 @@ def two_asset_prices():
 @pytest.fixture
 def one_asset_prices(two_asset_prices):
     return two_asset_prices[["A"]]
+
+
+@pytest.fixture
+def four_year_prices():
+    """~4 years of synthetic prices — enough for all backtest frequencies."""
+    rng = np.random.default_rng(7)
+    n = 1010   # ~4 trading years
+    dates = pd.date_range("2019-01-01", periods=n, freq="B")
+    return pd.DataFrame(
+        {
+            "A": 100 * np.exp(np.cumsum(rng.normal(0.0004, 0.012, n))),
+            "B": 100 * np.exp(np.cumsum(rng.normal(0.0003, 0.015, n))),
+        },
+        index=dates,
+    )
 
 
 # ─── portfolio_div_yield ──────────────────────────────────────────────────────
@@ -434,6 +450,102 @@ class TestComputePathDrawdowns:
         assert np.mean(max_dd > 0) > 0.70
 
 
+# ─── run_backtest ─────────────────────────────────────────────────────────────
+
+class TestRunBacktest:
+
+    def test_output_keys_present(self, four_year_prices):
+        """All documented return-dict keys must be present."""
+        w = np.array([0.6, 0.4])
+        bt = run_backtest(w, four_year_prices, 10_000, 500, "Monthly")
+        for key in (
+            "portfolio_values", "div_cash", "total_wealth", "drawdowns",
+            "total_invested", "n_steps", "n_years", "total_invested_final",
+            "final_wealth", "cagr", "total_return_pct", "max_drawdown",
+            "ann_vol", "sharpe", "annual_rets", "annual_years",
+            "best_yr", "worst_yr",
+        ):
+            assert key in bt, f"Missing key: {key!r}"
+
+    def test_initial_value_correct(self, four_year_prices):
+        """Portfolio value at t=0 must equal the initial argument."""
+        w = np.array([0.6, 0.4])
+        bt = run_backtest(w, four_year_prices, 12_345.0, 0, "Monthly")
+        assert bt["portfolio_values"].iloc[0] == pytest.approx(12_345.0)
+
+    def test_total_wealth_equals_portfolio_plus_div(self, four_year_prices):
+        """total_wealth must equal portfolio_values + div_cash at every step."""
+        w = np.array([0.6, 0.4])
+        bt = run_backtest(
+            w, four_year_prices, 10_000, 0, "Monthly",
+            drip=False, annual_div_yield=0.02,
+        )
+        np.testing.assert_allclose(
+            bt["total_wealth"].values,
+            bt["portfolio_values"].values + bt["div_cash"].values,
+            rtol=1e-10,
+        )
+
+    def test_drawdown_in_unit_range(self, four_year_prices):
+        """All drawdown values must be in [0, 1]."""
+        w = np.array([0.6, 0.4])
+        bt = run_backtest(w, four_year_prices, 10_000, 0, "Monthly")
+        assert np.all(bt["drawdowns"].values >= 0.0)
+        assert np.all(bt["drawdowns"].values <= 1.0 + 1e-10)
+
+    def test_drawdown_at_t0_is_zero(self, four_year_prices):
+        """Running peak at t=0 equals initial value → drawdown = 0."""
+        w = np.array([0.6, 0.4])
+        bt = run_backtest(w, four_year_prices, 10_000, 0, "Monthly")
+        assert bt["drawdowns"].iloc[0] == pytest.approx(0.0)
+
+    def test_contribution_increases_final_wealth(self, four_year_prices):
+        """Adding periodic contributions must increase the final wealth."""
+        w = np.array([0.6, 0.4])
+        bt_no  = run_backtest(w, four_year_prices, 10_000, 0,   "Monthly")
+        bt_yes = run_backtest(w, four_year_prices, 10_000, 500, "Monthly")
+        assert bt_yes["final_wealth"] > bt_no["final_wealth"]
+
+    def test_drip_off_div_cash_positive(self, four_year_prices):
+        """DRIP OFF with positive yield must accumulate dividend cash."""
+        w = np.array([0.6, 0.4])
+        bt = run_backtest(
+            w, four_year_prices, 10_000, 0, "Monthly",
+            drip=False, annual_div_yield=0.02,
+        )
+        assert bt["div_cash"].iloc[-1] > 0.0
+
+    def test_drip_on_div_cash_all_zeros(self, four_year_prices):
+        """DRIP ON must produce zero dividend cash regardless of yield."""
+        w = np.array([0.6, 0.4])
+        bt = run_backtest(
+            w, four_year_prices, 10_000, 0, "Monthly",
+            drip=True, annual_div_yield=0.03,
+        )
+        np.testing.assert_array_equal(bt["div_cash"].values, 0.0)
+
+    def test_annual_returns_length(self, four_year_prices):
+        """Should have at least 3 calendar-year return entries for 4-year data."""
+        w = np.array([0.6, 0.4])
+        bt = run_backtest(w, four_year_prices, 10_000, 0, "Monthly")
+        assert len(bt["annual_rets"]) >= 3
+        assert len(bt["annual_rets"]) == len(bt["annual_years"])
+
+    def test_insufficient_data_raises(self, two_asset_prices):
+        """Annually freq on ~2-year data must raise ValueError (< 3 periods)."""
+        w = np.array([0.6, 0.4])
+        with pytest.raises(ValueError, match="need at least 3"):
+            run_backtest(w, two_asset_prices, 10_000, 0, "Annually")
+
+    @pytest.mark.parametrize("freq", ["Weekly", "Monthly", "Bi-Monthly", "Annually"])
+    def test_all_frequencies_run(self, four_year_prices, freq):
+        """run_backtest must complete without error for all contribution frequencies."""
+        w = np.array([0.6, 0.4])
+        bt = run_backtest(w, four_year_prices, 10_000, 100, freq)
+        assert bt["n_steps"] > 0
+        assert np.isfinite(bt["cagr"])
+
+
 # ─── run_simulation — reproducibility ────────────────────────────────────────
 
 class TestRunSimulationReproducibility:
@@ -567,6 +679,12 @@ class TestSourceCodeHygiene:
     def test_simulation_exports_compute_path_drawdowns(self):
         """compute_path_drawdowns must be importable from simulation module."""
         from simulation import compute_path_drawdowns  # noqa: F401  (import test)
+
+    def test_app_imports_run_backtest(self):
+        """app.py must import run_backtest from simulation.py."""
+        with open("app.py", encoding="utf-8") as f:
+            source = f.read()
+        assert "run_backtest" in source
 
     def test_simulation_has_no_streamlit_import(self):
         """simulation.py must not import streamlit."""

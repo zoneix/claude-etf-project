@@ -25,6 +25,14 @@ FREQ: dict = {
     "Annually": 1,
 }
 
+# Contribution frequency → pandas resample rule (period-end prices)
+_BACKTEST_RESAMPLE: dict = {
+    "Weekly":     "W",    # last trading day of each Mon–Sun week
+    "Monthly":    "ME",   # last trading day of each month
+    "Bi-Monthly": "2ME",  # last trading day of every two months
+    "Annually":   "YE",   # last trading day of each year
+}
+
 
 # ---------------------------------------------------------------------------
 # Data helpers
@@ -335,3 +343,183 @@ def compute_path_drawdowns(portfolio_values: np.ndarray) -> np.ndarray:
         0.0,
     )
     return drawdowns
+
+
+# ---------------------------------------------------------------------------
+# Historical backtest engine
+# ---------------------------------------------------------------------------
+
+def run_backtest(
+    weights: np.ndarray,
+    prices: pd.DataFrame,
+    initial: float,
+    contribution: float,
+    freq: str,
+    drip: bool = True,
+    annual_div_yield: float = 0.0,
+) -> dict:
+    """
+    Historical backtest: replay actual price data through the weighted portfolio.
+
+    Unlike the Monte Carlo engine, this function uses the *real* price sequence
+    rather than sampling from its statistical distribution.  The result shows
+    how the portfolio would have behaved over the chosen historical window with
+    the user's contribution and DRIP settings applied.
+
+    Prices are assumed to be total-return (``auto_adjust=True``) so dividends
+    are already embedded; the ``annual_div_yield`` / ``drip`` parameters mirror
+    the Monte Carlo DRIP logic for consistency.
+
+    Parameters
+    ----------
+    weights          : portfolio weights, shape (n_assets,).  Should sum to 1.
+    prices           : historical adjusted-close DataFrame, columns = tickers.
+    initial          : starting portfolio value ($).
+    contribution     : per-period cash contribution ($).
+    freq             : contribution frequency key from ``FREQ`` dict.
+    drip             : True → dividends reinvested; False → paid out as cash.
+    annual_div_yield : portfolio-weighted annual dividend yield (used only
+                       when drip=False).
+
+    Returns
+    -------
+    dict with keys
+        portfolio_values     pd.Series — portfolio value at each period-end date
+        div_cash             pd.Series — cumulative dividends paid out (DRIP OFF)
+        total_wealth         pd.Series — portfolio_values + div_cash
+        drawdowns            pd.Series — running drawdown fraction in [0, 1]
+        total_invested       pd.Series — cumulative cash invested
+        n_steps              int — number of contribution periods backtested
+        n_years              float — horizon length in years
+        total_invested_final float
+        final_wealth         float
+        cagr                 float — annualised daily-compounded return
+        total_return_pct     float — (final_wealth / total_invested - 1)
+        max_drawdown         float — worst peak-to-trough fraction
+        ann_vol              float — annualised daily volatility
+        sharpe               float — annualised Sharpe (rf = 0)
+        annual_rets          np.ndarray — calendar-year portfolio returns
+        annual_years         np.ndarray — corresponding calendar years (int)
+        best_yr              float — best calendar-year return
+        worst_yr             float — worst calendar-year return
+
+    Raises
+    ------
+    ValueError
+        When fewer than 3 resampled periods exist in the price history (need
+        at least 2 return observations for a meaningful backtest).
+    """
+    rule = _BACKTEST_RESAMPLE[freq]
+    steps_per_yr = FREQ[freq]
+
+    # Period-end prices at the contribution frequency, dropping incomplete bins.
+    prices_at_freq = prices.resample(rule).last().dropna()
+
+    if len(prices_at_freq) < 3:
+        raise ValueError(
+            f"Only {len(prices_at_freq)} {freq.lower()} period(s) found in the "
+            "selected history — need at least 3.  Choose a longer historical period."
+        )
+
+    # N-1 period returns from N period-end prices.
+    period_rets = prices_at_freq.pct_change().dropna()
+    n_steps = len(period_rets)
+
+    div_per_period = (
+        annual_div_yield / steps_per_yr
+        if (not drip and annual_div_yield > 0.0)
+        else 0.0
+    )
+
+    # ── Forward simulation through actual returns ──────────────────────────────
+    portfolio_values = np.zeros(n_steps + 1)
+    portfolio_values[0] = initial
+    div_cash = np.zeros(n_steps + 1)
+
+    for t in range(n_steps):
+        port_ret = float(np.dot(weights, period_rets.iloc[t].values))
+        if div_per_period > 0.0:
+            price_ret = port_ret - div_per_period
+            div_payout = max(0.0, portfolio_values[t] * div_per_period)
+            div_cash[t + 1] = div_cash[t] + div_payout
+            portfolio_values[t + 1] = (
+                portfolio_values[t] * (1.0 + price_ret) + contribution
+            )
+        else:
+            portfolio_values[t + 1] = (
+                portfolio_values[t] * (1.0 + port_ret) + contribution
+            )
+
+    # Index: prices_at_freq has exactly n_steps + 1 rows → aligns perfectly.
+    idx = prices_at_freq.index
+    total_wealth = portfolio_values + div_cash
+    total_invested_arr = initial + contribution * np.arange(n_steps + 1)
+
+    # ── Drawdown ───────────────────────────────────────────────────────────────
+    running_peak = np.maximum.accumulate(total_wealth)
+    drawdowns = np.where(
+        running_peak > 0,
+        (running_peak - total_wealth) / running_peak,
+        0.0,
+    )
+
+    # ── Aggregate metrics ──────────────────────────────────────────────────────
+    n_years = n_steps / steps_per_yr
+    total_invested_final = float(total_invested_arr[-1])
+    final_wealth = float(total_wealth[-1])
+    total_return_pct = (
+        (final_wealth / total_invested_final - 1.0)
+        if total_invested_final > 0.0
+        else 0.0
+    )
+    max_drawdown = float(drawdowns.max())
+
+    # CAGR and Sharpe from daily returns (finer-grained than period returns).
+    daily_rets = prices.pct_change().dropna()
+    port_daily = daily_rets.values @ weights
+    n_trading_days = len(port_daily)
+    cagr = (
+        float((1.0 + port_daily).prod() ** (252.0 / n_trading_days) - 1.0)
+        if n_trading_days > 0
+        else 0.0
+    )
+    daily_std = float(np.std(port_daily))
+    ann_vol = daily_std * np.sqrt(252.0)
+    sharpe = (
+        float(np.mean(port_daily) / daily_std * np.sqrt(252.0))
+        if daily_std > 0.0
+        else 0.0
+    )
+
+    # Calendar-year returns (year-end-to-year-end from daily prices).
+    try:
+        annual_prices = prices.resample("YE").last().pct_change().dropna()
+        annual_rets = (annual_prices.values @ weights).astype(float)
+        annual_years = annual_prices.index.year.to_numpy()
+    except Exception:
+        annual_rets = np.array([], dtype=float)
+        annual_years = np.array([], dtype=int)
+
+    best_yr = float(annual_rets.max()) if len(annual_rets) > 0 else float("nan")
+    worst_yr = float(annual_rets.min()) if len(annual_rets) > 0 else float("nan")
+
+    return {
+        "portfolio_values":     pd.Series(portfolio_values,   index=idx),
+        "div_cash":             pd.Series(div_cash,           index=idx),
+        "total_wealth":         pd.Series(total_wealth,       index=idx),
+        "drawdowns":            pd.Series(drawdowns,          index=idx),
+        "total_invested":       pd.Series(total_invested_arr, index=idx),
+        "n_steps":              n_steps,
+        "n_years":              n_years,
+        "total_invested_final": total_invested_final,
+        "final_wealth":         final_wealth,
+        "cagr":                 cagr,
+        "total_return_pct":     total_return_pct,
+        "max_drawdown":         max_drawdown,
+        "ann_vol":              ann_vol,
+        "sharpe":               sharpe,
+        "annual_rets":          annual_rets,
+        "annual_years":         annual_years,
+        "best_yr":              best_yr,
+        "worst_yr":             worst_yr,
+    }
